@@ -21,6 +21,10 @@ import random
 import argparse
 from collections import defaultdict
 
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
+
 # Import environment
 from src.env.blackjack_env import (
     BlackjackEnv, Rules,
