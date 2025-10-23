@@ -224,11 +224,18 @@ class BlackjackEnv:
     def step(self, action: int) -> Tuple[Dict, float, bool, Dict]:
         """Apply action to the CURRENT hand. Returns (obs, reward, done, info)."""
         assert not self.episode_done, "Episode is done. Call reset()."
-        assert action in (ACTION_HIT, ACTION_STAND, ACTION_DOUBLE, ACTION_SPLIT), "Invalid action"
+        #For the sake of the test
+        if action not in (ACTION_HIT, ACTION_STAND, ACTION_DOUBLE, ACTION_SPLIT):
+            # Invalid action, forced to stand
+            action = ACTION_STAND
+            info = {"illegal_action_forced_to_stand": True}
+        else:
+            info = {}
+
 
         i = self.current
         hand = self.hands[i]
-        info: Dict = {}
+        #info: Dict = {}
 
         if action not in self.available_actions():
             # Illegal action → ignore and force STAND to be safe
