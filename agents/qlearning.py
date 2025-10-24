@@ -13,6 +13,7 @@ Usage:
 """
 
 import os
+import shutil
 import sys
 import math
 import time
@@ -20,7 +21,7 @@ import pickle
 import random
 import argparse
 from collections import defaultdict
-
+import csv 
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -101,13 +102,24 @@ class QLearningAgent:
     # Save / load utilities
     def save(self, path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = {
+            "Q": dict(self.Q),
+            "eps": self.eps,
+            "_steps": self._steps
+        }
         with open(path, "wb") as f:
-            pickle.dump(dict(self.Q), f)
+            pickle.dump(data, f)
 
     def load(self, path: str):
         with open(path, "rb") as f:
-            d = pickle.load(f)
-        self.Q = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0], d)
+            data = pickle.load(f)
+        if isinstance(data, dict) and "Q" in data:
+            self.Q = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0], data["Q"])
+            self.eps = data.get("eps", self.eps)
+            self._steps = data.get("_steps", 0)
+        else:
+            # backward compatibility (old format)
+            self.Q = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0], data)
 
 # ---------------------------
 # Training loop
@@ -119,34 +131,51 @@ def train(args):
                            eps_start=args.eps_start, eps_end=args.eps_end,
                            eps_decay=args.eps_decay, seed=seed)
 
+    # --- Load existing Q-table if provided ---
+    if getattr(args, "load", None) and os.path.exists(args.load):
+      print(f"[train] Loading existing Q-table from {args.load}")
+      agent.load(args.load)
+    else:
+      print("[train] Starting with a new Q-table")
+
     episodes = args.episodes
     log_every = max(1000, episodes // 100)
 
     total_reward = 0.0
     wins = losses = pushes = 0
 
+    # --- Logging setup ---
+    os.makedirs("logs", exist_ok=True)
+    log_path = os.path.join("logs", "agent_results.csv")
+
+    if not os.path.exists(log_path):
+        with open(log_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["episode", "winrate", "avg_return", "epsilon"])
+
+    # --- Backup old model if it exists ---
+    if args.save and os.path.exists(args.save):
+      backup_path = args.save + ".bak"
+      shutil.copy2(args.save, backup_path)
+      print(f"[train] Backup copied to: {backup_path}")
+
     t0 = time.time()
     for ep in range(1, episodes + 1):
         obs, r, done, info = env.reset()
         s = state_key(obs)
+        ep_return = 0.0
 
-        ep_return = 0.0  # cumulative reward across subhands
-        # Play until all subhands are resolved
         while not done:
             legal = env.available_actions()
             a = agent.policy(obs, legal)
-
             obs_next, r, done, _ = env.step(a)
             sp = state_key(obs_next)
             legal_next = env.available_actions() if not done else []
-
             agent.update(s, a, r, sp, legal_next, done)
-
             ep_return += r
             obs, s = obs_next, sp
 
         total_reward += ep_return
-        # Classify outcome: win / loss / push
         if ep_return > 1e-12: wins += 1
         elif ep_return < -1e-12: losses += 1
         else: pushes += 1
@@ -155,11 +184,14 @@ def train(args):
             wr = wins / ep
             avg_ret = total_reward / ep
             print(f"[train] ep={ep}/{episodes} | winrate={wr:.3f} | avg_return={avg_ret:.3f} | eps={agent.eps:.3f}")
+            with open(log_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([ep, wr, avg_ret, agent.eps])
 
-    # Save Q-table
+    # --- Save updated Q-table ---
     if args.save:
         agent.save(args.save)
-        print("Saved Q-table to", args.save)
+        print(f"Saved Q-table to {args.save}")
 
 # ---------------------------
 # Greedy evaluation
@@ -203,6 +235,7 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    # TRAIN
     ap_t = sub.add_parser("train", help="Train Q-learning")
     ap_t.add_argument("--episodes", type=int, default=200_000)
     ap_t.add_argument("--alpha", type=float, default=0.1)
@@ -212,7 +245,9 @@ def main():
     ap_t.add_argument("--eps-decay", type=float, default=5e-6)
     ap_t.add_argument("--seed", type=int, default=7)
     ap_t.add_argument("--save", type=str, default="models/qtable.pkl")
+    ap_t.add_argument("--load", type=str, help="Path to existing Q-table to continue training")
 
+    # EVAL
     ap_e = sub.add_parser("eval", help="Evaluate greedy policy")
     ap_e.add_argument("--episodes", type=int, default=20_000)
     ap_e.add_argument("--seed", type=int, default=123)
