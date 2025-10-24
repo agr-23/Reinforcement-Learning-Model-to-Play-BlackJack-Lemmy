@@ -23,4 +23,3 @@ def test_bellman_update_sanity():
 
     expected = 0.0 + 0.5 * (1.0 + 0.9 * 2.0 - 0.0)
     assert pytest.approx(agent.Q[s][a], rel=1e-6) == expected
-

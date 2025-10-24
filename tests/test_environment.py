@@ -107,6 +107,3 @@ def test_available_actions_respect_rules(env_default):
         assert ACTION_DOUBLE in acts
     if obs["can_split"]:
         assert ACTION_SPLIT in acts
-
-
-
