@@ -39,3 +39,22 @@ class DQNNet(nn.Module):
         if not isinstance(x, torch.Tensor):
             x = torch.tensor(x, dtype=torch.float32)
         return self.net(x)
+
+
+    def load_checkpoint_safe(self, checkpoint_path):
+        """
+        Carga un checkpoint de manera segura en el modelo, ignorando capas incompatibles.
+        """
+        ckpt = torch.load(checkpoint_path)
+        model_dict = self.state_dict()
+
+        # Filtrar solo los pesos que coinciden en nombre y tamaño
+        pretrained_dict = {k: v for k, v in ckpt["policy_state"].items()
+                           if k in model_dict and v.size() == model_dict[k].size()}
+
+        # Actualizar el modelo con esos pesos
+        model_dict.update(pretrained_dict)
+        self.load_state_dict(model_dict)
+
+        print(f"[INFO] Cargadas {len(pretrained_dict)} capas del checkpoint. "
+              f"Las demás inicializadas desde cero.")

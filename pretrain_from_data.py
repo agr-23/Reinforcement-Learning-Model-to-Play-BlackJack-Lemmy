@@ -1,7 +1,7 @@
-# pretrain_from_dataset.py
 """
 Pretrain DQNNet by behavior cloning from a CSV dataset of Blackjack hands.
 Saves checkpoint compatible with agents/train_dqn.py in models/dqn_pretrain/.
+Updated to include correct feature dimension (10) matching train_dqn.py.
 """
 import os
 import argparse
@@ -26,6 +26,7 @@ from models.dqn_net import DQNNet
 
 # map dataset action letters to integers used in env: H=0, S=1, D=2, P=3
 ACTION_MAP = {'H': 0, 'S': 1, 'D': 2, 'P': 3}
+
 
 def parse_initial_hand(cell):
     """
@@ -53,6 +54,7 @@ def parse_initial_hand(cell):
     parts = re.findall(r'\d+', s)
     return [int(p) for p in parts]
 
+
 def get_first_valid_action(cell):
     """
     actions_taken may be a string with sequence like "H;S" or "H" or "S,D".
@@ -67,38 +69,32 @@ def get_first_valid_action(cell):
         return None
     return m.group(0)
 
+
 def make_feature_from_row(row):
     """
     Build same features as obs_to_tensor in train_dqn:
     [player_total/21, usable_ace, dealer_up_norm, true_count/10,
-     cards_remaining/312, hand_index/4, num_hands/4, can_double, can_split]
+     cards_remaining/312, hand_index/4, num_hands/4, can_double, can_split, episode_stage/3]
     """
-    # initial_hand -> player_total, usable_ace, can_double, can_split
     hand = parse_initial_hand(row.get('initial_hand', None))
     if not hand:
-        # fallback to player_final/player_final_value if available
         if pd.notna(row.get('player_final_value')):
             total = int(row['player_final_value'])
-            hand = [total]  # best effort
+            hand = [total]
         else:
             return None
     total = sum(hand)
-    # usable ace if any ace counted as 11 present (dataset stores A as 11)
     usable_ace = 1 if 11 in hand else 0
     dealer_up = int(row.get('dealer_up', 2))
-    # run_count exists in dataset; use it as true_count (approx)
     true_count = int(row.get('run_count', 0))
     cards_remaining = int(row.get('cards_remaining', 312))
-    # hand_index/num_hands unknown in dataset -> set 0 and 1
     hand_index = 0
     num_hands = 1
     can_double = 1 if len(hand) == 2 else 0
-    # can_split if pair (same value) and exactly 2 cards
     can_split = 0
     if len(hand) == 2 and (hand[0] == hand[1] or (hand[0] == 10 and hand[1] == 10)):
         can_split = 1
 
-    # normalize same as obs_to_tensor
     player_total_n = float(total) / 21.0
     usable_ace_n = float(usable_ace)
     dealer_up_n = float(dealer_up - 2) / 9.0
@@ -108,16 +104,17 @@ def make_feature_from_row(row):
     num_hands_n = float(num_hands) / 4.0
     can_double_n = float(can_double)
     can_split_n = float(can_split)
+    episode_stage = 1  # Asumimos etapa de juego en dataset, normalizada abajo
+    episode_stage_n = float(episode_stage) / 3.0
 
     return np.array([player_total_n, usable_ace_n, dealer_up_n, true_count_n,
-                     cards_remaining_n, hand_index_n, num_hands_n, can_double_n, can_split_n], dtype=np.float32)
+                     cards_remaining_n, hand_index_n, num_hands_n, can_double_n, can_split_n, episode_stage_n], dtype=np.float32)
+
 
 def build_dataset_from_csv(path, sample_size=3_000_000, chunksize=200_000, max_rows=None):
     """
     Stream CSV in chunks, filter rows with first action in H/S/D/P, build features and labels.
     Returns X (numpy float32) and y (int).
-    - sample_size: approximate number of rows to collect (we stop when reached).
-    - max_rows: optional limit of total rows to scan (for debugging).
     """
     X_list = []
     y_list = []
@@ -149,6 +146,7 @@ def build_dataset_from_csv(path, sample_size=3_000_000, chunksize=200_000, max_r
     y = np.array(y_list, dtype=np.int64)
     return X, y
 
+
 def train_model(X, y, hidden=(128,128), epochs=5, batch_size=1024, lr=1e-4,
                 weight_decay=1e-6, device='cpu', save_dir='models/dqn_pretrain'):
     os.makedirs(save_dir, exist_ok=True)
@@ -157,7 +155,6 @@ def train_model(X, y, hidden=(128,128), epochs=5, batch_size=1024, lr=1e-4,
     action_dim = 4
     model = DQNNet(state_dim, action_dim, hidden=hidden).to(device)
 
-    # prepare dataset & dataloaders
     dataset = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
     val_size = int(0.1 * len(dataset))
     train_size = len(dataset) - val_size
@@ -188,7 +185,6 @@ def train_model(X, y, hidden=(128,128), epochs=5, batch_size=1024, lr=1e-4,
             global_steps += xb.size(0)
         train_loss = running_loss / train_size
 
-        # validation
         model.eval()
         vloss = 0.0
         with torch.no_grad():
@@ -205,12 +201,11 @@ def train_model(X, y, hidden=(128,128), epochs=5, batch_size=1024, lr=1e-4,
             best_val = val_loss
             best_state = model.state_dict()
 
-    # save best checkpoint
     ckpt = {
         'policy_state': best_state if best_state is not None else model.state_dict(),
         'target_state': best_state if best_state is not None else model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
-        'eps': 1.0,                # keep exploration high initially for RL continuation
+        'eps': 1.0,
         'global_steps': 0,
         'replay': None
     }
@@ -219,9 +214,10 @@ def train_model(X, y, hidden=(128,128), epochs=5, batch_size=1024, lr=1e-4,
     print(f"Saved pretrain checkpoint to {save_path}")
     return save_path
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", type=str, default="data/BJ_dataset.csv")
+    parser.add_argument("--csv", type=str, default="data/blackjack_US_HSDP")
     parser.add_argument("--sample-size", type=int, default=3_000_000)
     parser.add_argument("--chunksize", type=int, default=200_000)
     parser.add_argument("--epochs", type=int, default=5)
@@ -237,6 +233,7 @@ def main():
     ckpt_path = train_model(X, y, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
                             device=args.device, save_dir=args.save_dir)
     print("Done. Checkpoint:", ckpt_path)
+
 
 if __name__ == "__main__":
     main()

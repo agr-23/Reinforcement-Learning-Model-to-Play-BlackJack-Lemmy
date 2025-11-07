@@ -1,10 +1,10 @@
-# agents/train_dqn.py
 """
 Enhanced DQN Trainer for Blackjack (Lemmy) – Masked Double DQN
 - Enmascara acciones ilegales (Double/Split) en el TARGET con info de next_state
 - Double DQN + Huber loss
 - Funciona con 1 mazo (curriculum) y sin last_drawn_cards() en el env
 - Heurística Hi-Lo opcional para evaluación
+- --- Integrado: Estrategia básica como política mixta durante entrenamiento ---
 """
 
 import os
@@ -26,7 +26,8 @@ from src.replay_buffer import ReplayBuffer
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ----------------- Hi-Lo helpers (opcionales) -----------------
+
+# ----------------- Hi-Lo helpers -----------------
 def hilo_count(card):
     if card in [2, 3, 4, 5, 6]:
         return +1
@@ -35,16 +36,32 @@ def hilo_count(card):
     else:
         return 0
 
+
 def update_hilo_state(obs, running_count, decks_remaining):
     true_count = running_count / max(1, decks_remaining) if decks_remaining > 0 else running_count
     obs["true_count"] = float(np.clip(true_count, -10, 10))
     return obs
 
+
+# ----------------- Estrategia básica -----------------
+def basic_strategy(obs):
+    pt = obs.get("player_total", 0)
+    dealer_up = obs.get("dealer_up", 2)
+    usable_ace = obs.get("usable_ace", 0)
+    can_double = obs.get("can_double", 0)
+    can_split = obs.get("can_split", 0)
+
+    if can_split and pt in [20, 22]:  # pares 10,10 o A,A
+        return 3
+    if pt >= 17:
+        return 1
+    if pt <= 11 and can_double:
+        return 2
+    return 0
+
+
 # ----------------- Obs -> vector -----------------
 def obs_to_tensor(obs):
-    # Orden de features (¡importante!):
-    # 0 player_total, 1 usable_ace, 2 dealer_up, 3 true_count, 4 cards_remaining,
-    # 5 hand_index, 6 num_hands, 7 can_double, 8 can_split, 9 episode_stage
     player_total    = float(obs.get("player_total", 0)) / 21.0
     usable_ace      = float(obs.get("usable_ace", 0))
     dealer_up       = (float(obs.get("dealer_up", 0)) - 2) / 9.0
@@ -61,6 +78,7 @@ def obs_to_tensor(obs):
         dtype=np.float32
     )
 
+
 # ----------------- Heurística baseline -----------------
 def heuristic_hilo_policy(obs):
     pt = obs["player_total"]
@@ -74,6 +92,7 @@ def heuristic_hilo_policy(obs):
         a = 2
     return a
 
+
 # ----------------- Evaluación -----------------
 def evaluate_policy(env, net, episodes=1000, seed=0, use_heuristic=False):
     wins = losses = pushes = 0
@@ -86,7 +105,6 @@ def evaluate_policy(env, net, episodes=1000, seed=0, use_heuristic=False):
             running_count = 0
             while not done:
                 legal = env.available_actions()
-                # --- FIX: si el entorno devuelve lista vacía, termina el episodio de forma segura ---
                 if not legal:
                     done = True
                     break
@@ -120,6 +138,21 @@ def evaluate_policy(env, net, episodes=1000, seed=0, use_heuristic=False):
     print(f"Avg return: {total_reward/episodes:.3f}")
     return wins, losses, pushes, total_reward
 
+
+# ----------------- Carga segura de checkpoint -----------------
+def load_checkpoint_safe(model, checkpoint_path):
+    ckpt = torch.load(checkpoint_path, map_location=DEVICE)
+    model_dict = model.state_dict()
+
+    pretrained_dict = {k: v for k, v in ckpt["policy_state"].items()
+                       if k in model_dict and v.size() == model_dict[k].size()}
+
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(model_dict)
+    print(f"[INFO] Cargadas {len(pretrained_dict)} capas del checkpoint. "
+          f"Las demás inicializadas desde cero.")
+
+
 # ----------------- Entrenamiento -----------------
 def main():
     parser = argparse.ArgumentParser()
@@ -146,30 +179,34 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True); os.makedirs("logs", exist_ok=True)
     log_path = Path("logs/dqn_results.csv")
 
-    # Curriculum: 1 mazo para aprender más rápido
     env = BlackjackEnv(Rules(n_decks=1, h17=True, peek=True), seed=args.seed)
-    state_dim, action_dim = 10, 4  # usamos can_double/can_split en el mask del TARGET
+    state_dim, action_dim = 10, 4
 
     policy_net = DQNNet(state_dim, action_dim).to(DEVICE)
     target_net = DQNNet(state_dim, action_dim).to(DEVICE)
     target_net.load_state_dict(policy_net.state_dict())
-    optimizer = optim.Adam(policy_net.parameters(), lr=args.lr)
     replay = ReplayBuffer(args.buffer_size, seed=args.seed)
 
     global_steps = 0
     eps = args.eps_start
     start_episode = 0
 
+    optimizer = optim.Adam(policy_net.parameters(), lr=args.lr)
+
     if args.load:
+        load_checkpoint_safe(policy_net, args.load)
+        target_net.load_state_dict(policy_net.state_dict())
         ckpt = torch.load(args.load, map_location=DEVICE)
-        policy_net.load_state_dict(ckpt["policy_state"])
-        target_net.load_state_dict(ckpt.get("target_state", ckpt["policy_state"]))
-        optimizer.load_state_dict(ckpt["optimizer_state"])
+
+        # Ignorar optimizer_state si es incompatible
+        if "optimizer_state" in ckpt:
+            print("[INFO] Ignorando optimizer_state del checkpoint (arquitectura incompatible)")
+
         replay.load(ckpt.get("replay", None))
         global_steps = ckpt.get("global_steps", 0)
         eps = ckpt.get("eps", args.eps_start)
         start_episode = ckpt.get("episode", 0)
-        print(f"Loaded checkpoint: {args.load} | steps={global_steps:,} | eps={eps:.3f}")
+        print(f"[INFO] Loaded checkpoint: {args.load} | steps={global_steps:,} | eps={eps:.3f}")
 
     if args.eval_only:
         print("[Eval-only]")
@@ -183,6 +220,7 @@ def main():
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(["global_steps", "episode", "winrate", "avg_return"])
 
+    # ----------------- Loop de entrenamiento -----------------
     for ep in range(start_episode + 1, args.episodes + 1):
         obs, r, done, _ = env.reset()
         running_count = 0
@@ -191,12 +229,10 @@ def main():
 
         while not done:
             legal = env.available_actions()
-            # --- FIX: si no hay acciones legales, cerramos el episodio de forma segura ---
             if not legal:
                 done = True
                 break
 
-            # Actualiza Hi-Lo si el env lo soporta
             if hasattr(env, "last_drawn_cards"):
                 cards = env.last_drawn_cards()
                 if cards:
@@ -205,32 +241,35 @@ def main():
             obs = update_hilo_state(obs, running_count, decks_rem)
             s = obs_to_tensor(obs)
 
-            # Epsilon-decay
             eps = max(args.eps_end,
                       args.eps_start - (global_steps / args.eps_decay_steps) * (args.eps_start - args.eps_end))
 
-            # Selección de acción (con máscara de legalidad)
+            p_policy = 0.8
             if random.random() < eps:
                 a = random.choice(legal)
             else:
-                s_t = torch.from_numpy(s).to(DEVICE).unsqueeze(0)
-                with torch.no_grad():
-                    qvals = policy_net(s_t).squeeze(0)
-                    mask = torch.full_like(qvals, -1e9)
-                    mask[legal] = 0.0
-                    a = int((qvals + mask).argmax().item())
+                if random.random() < p_policy:
+                    s_t = torch.from_numpy(s).to(DEVICE).unsqueeze(0)
+                    with torch.no_grad():
+                        qvals = policy_net(s_t).squeeze(0)
+                        mask = torch.full_like(qvals, -1e9)
+                        mask[legal] = 0.0
+                        a = int((qvals + mask).argmax().item())
+                else:
+                    a_basic = basic_strategy(obs)
+                    if a_basic in legal:
+                        a = a_basic
+                    else:
+                        a = random.choice(legal)
 
             obs_next, r, done, _ = env.step(a)
             s_next = obs_to_tensor(obs_next)
-
-            # Guardar transición
             replay.push(s, a, r, s_next, done)
             s = s_next
             obs = obs_next
             ep_return += r
             global_steps += 1
 
-            # Entrenamiento
             if len(replay) >= args.start_train and len(replay) >= args.batch_size:
                 batch = replay.sample(args.batch_size)
                 states = torch.from_numpy(np.vstack([b[0] for b in batch])).to(DEVICE)
@@ -239,41 +278,29 @@ def main():
                 next_states = torch.from_numpy(np.vstack([b[3] for b in batch])).to(DEVICE)
                 dones = torch.tensor([b[4] for b in batch], dtype=torch.float32, device=DEVICE)
 
-                # Q(s,a)
                 q_sa = policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
 
-                # --------- MÁSCARA DE ACCIONES ILEGALES EN next_state ----------
-                # Usamos columnas 7 y 8 del vector: can_double, can_split
                 with torch.no_grad():
-                    # Extrae flags desde next_states (por posición fija del vector)
-                    can_double_next = (next_states[:, 7] > 0.5).float().unsqueeze(1)  # [B,1]
-                    can_split_next  = (next_states[:, 8] > 0.5).float().unsqueeze(1)  # [B,1]
+                    can_double_next = (next_states[:, 7] > 0.5).float().unsqueeze(1)
+                    can_split_next  = (next_states[:, 8] > 0.5).float().unsqueeze(1)
 
-                    # Construye máscara [B,4]: 0 (permitido) / -1e9 (prohibido)
                     B = next_states.size(0)
                     mask_next = torch.zeros((B, 4), device=DEVICE)
-                    # Acción 2 = Double requiere can_double
                     mask_next[:, 2] = torch.where(can_double_next.squeeze(1) > 0.5,
                                                   torch.tensor(0.0, device=DEVICE),
                                                   torch.tensor(-1e9, device=DEVICE))
-                    # Acción 3 = Split requiere can_split
                     mask_next[:, 3] = torch.where(can_split_next.squeeze(1) > 0.5,
                                                   torch.tensor(0.0, device=DEVICE),
                                                   torch.tensor(-1e9, device=DEVICE))
-                    # Acciones 0 (Hit) y 1 (Stand) siempre legales
 
-                    # Double DQN: acción greedy del policy_net con máscara
                     q_next_policy = policy_net(next_states) + mask_next
                     next_actions = q_next_policy.argmax(1)
 
-                    # Valor con target_net y misma máscara
                     q_next_target = target_net(next_states) + mask_next
                     next_q = q_next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
-
                     target = rewards + args.gamma * next_q * (1.0 - dones)
 
                 loss = nn.SmoothL1Loss()(q_sa, target)
-
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 10.0)
@@ -283,8 +310,9 @@ def main():
                     target_net.load_state_dict(policy_net.state_dict())
 
             if global_steps % args.eval_every == 0:
-                wins, losses, pushes, total_reward_eval = evaluate_policy(env, policy_net,
-                                                                          episodes=args.eval_episodes, seed=args.seed)
+                wins, losses, pushes, total_reward_eval = evaluate_policy(
+                    env, policy_net, episodes=args.eval_episodes, seed=args.seed
+                )
                 winrate = wins / args.eval_episodes
                 avg_ret = total_reward_eval / args.eval_episodes
                 print(f"[Eval] steps={global_steps:,} | win={winrate:.3f} | avg_return={avg_ret:.3f} | eps={eps:.3f}")
@@ -293,7 +321,6 @@ def main():
                 ckpt = {
                     "policy_state": policy_net.state_dict(),
                     "target_state": target_net.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
                     "eps": eps,
                     "global_steps": global_steps,
                     "replay": replay.save_state(),
@@ -306,6 +333,7 @@ def main():
 
     print("Training finished")
     torch.save(policy_net.state_dict(), os.path.join(args.save_dir, "dqn_final.pth"))
+
 
 if __name__ == "__main__":
     main()
