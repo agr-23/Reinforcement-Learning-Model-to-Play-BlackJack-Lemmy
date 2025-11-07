@@ -27,7 +27,6 @@ from models.dqn_net import DQNNet
 # map dataset action letters to integers used in env: H=0, S=1, D=2, P=3
 ACTION_MAP = {'H': 0, 'S': 1, 'D': 2, 'P': 3}
 
-
 def parse_initial_hand(cell):
     """
     Try to parse initial_hand column. Supports:
@@ -54,7 +53,6 @@ def parse_initial_hand(cell):
     parts = re.findall(r'\d+', s)
     return [int(p) for p in parts]
 
-
 def get_first_valid_action(cell):
     """
     actions_taken may be a string with sequence like "H;S" or "H" or "S,D".
@@ -68,7 +66,6 @@ def get_first_valid_action(cell):
     if not m:
         return None
     return m.group(0)
-
 
 def make_feature_from_row(row):
     """
@@ -110,7 +107,6 @@ def make_feature_from_row(row):
     return np.array([player_total_n, usable_ace_n, dealer_up_n, true_count_n,
                      cards_remaining_n, hand_index_n, num_hands_n, can_double_n, can_split_n, episode_stage_n], dtype=np.float32)
 
-
 def build_dataset_from_csv(path, sample_size=3_000_000, chunksize=200_000, max_rows=None):
     """
     Stream CSV in chunks, filter rows with first action in H/S/D/P, build features and labels.
@@ -145,7 +141,6 @@ def build_dataset_from_csv(path, sample_size=3_000_000, chunksize=200_000, max_r
     X = np.stack(X_list, axis=0).astype(np.float32)
     y = np.array(y_list, dtype=np.int64)
     return X, y
-
 
 def train_model(X, y, hidden=(128,128), epochs=5, batch_size=1024, lr=1e-4,
                 weight_decay=1e-6, device='cpu', save_dir='models/dqn_pretrain'):
@@ -214,7 +209,6 @@ def train_model(X, y, hidden=(128,128), epochs=5, batch_size=1024, lr=1e-4,
     print(f"Saved pretrain checkpoint to {save_path}")
     return save_path
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", type=str, default="data/blackjack_US_HSDP")
@@ -233,7 +227,6 @@ def main():
     ckpt_path = train_model(X, y, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
                             device=args.device, save_dir=args.save_dir)
     print("Done. Checkpoint:", ckpt_path)
-
 
 if __name__ == "__main__":
     main()

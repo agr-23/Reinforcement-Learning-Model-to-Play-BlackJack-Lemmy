@@ -1,3 +1,33 @@
+"""
+Learning Progress Visualization Script for Blackjack RL Agent
+
+This script generates visualization plots to analyze the training progress of the 
+reinforcement learning agent playing Blackjack. It processes training logs and 
+creates informative plots showing:
+
+1. Smoothed winrate over training episodes
+2. Smoothed average return over training episodes
+
+Features:
+- Reads training metrics from 'logs/agent_results.csv'
+- Applies smoothing with a 20,000-episode window for clearer trend visualization
+- Creates a dual-axis plot combining winrate and average return
+- Automatically saves high-resolution plot to 'logs/qlearning_training_progress.png'
+
+Required CSV format:
+- episode: Training episode number
+- winrate: Win rate for the evaluation period
+- avg_return: Average return for the evaluation period
+- epsilon: Exploration rate (optional)
+
+Usage:
+    python plot_learning_progress.py
+
+Output:
+- Displays the plot in an interactive window
+- Saves the plot as 'qlearning_training_progress.png' in the logs directory
+"""
+
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt

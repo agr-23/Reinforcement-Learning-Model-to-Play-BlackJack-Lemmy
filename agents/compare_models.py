@@ -1,3 +1,44 @@
+"""
+Blackjack DQN Model Comparison Tool
+
+This script provides functionality to evaluate and compare different DQN model checkpoints
+in the Blackjack environment. It's particularly useful for comparing the performance of
+different training stages (pretrained, fine-tuned, and merged models).
+
+Key Features:
+- Supports multiple checkpoint formats (state_dict, policy_state)
+- Evaluates models using consistent environment settings
+- Calculates key performance metrics:
+  * Win rate (percentage of winning hands)
+  * Average reward per episode
+- Handles state preprocessing identically to training
+
+Default Evaluation Setup:
+- Tests each model over 2000 episodes
+- Compares three model variants:
+  1. Pretrained model (from supervised learning)
+  2. Fine-tuned model (from RL training)
+  3. Merged model (combination of both)
+
+Usage:
+    python agents/compare_models.py
+
+Output Example:
+    Evaluating models...
+    
+    Evaluating pretrain...
+    pretrain: win_rate=43.25% | avg_reward=-0.135
+    
+    Evaluating finetune...
+    finetune: win_rate=45.80% | avg_reward=-0.084
+    
+    Evaluating merged...
+    merged: win_rate=44.95% | avg_reward=-0.102
+
+Note: The script automatically normalizes state values and handles the same
+action space as during training (Hit, Stand, Double, Split).
+"""
+
 import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 

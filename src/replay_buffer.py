@@ -1,4 +1,38 @@
-# src/replay_buffer.py
+"""
+Experience Replay Buffer Implementation for Deep Q-Learning
+
+This module implements a circular buffer for storing and sampling transitions in 
+reinforcement learning, specifically designed for the DQN (Deep Q-Network) agent
+training in the Blackjack environment.
+
+Key Features:
+- Circular buffer implementation with fixed capacity
+- Efficient memory usage with numpy arrays
+- Random sampling for experience replay
+- Checkpoint support for saving/loading buffer state
+- Type conversion handling for numerical stability
+
+The buffer stores transitions as tuples of (state, action, reward, next_state, done):
+- state: Current state as numpy float32 array
+- action: Integer representing the action taken
+- reward: Float value of the reward received
+- next_state: Next state as numpy float32 array
+- done: Boolean indicating if the episode ended
+
+Usage Example:
+    buffer = ReplayBuffer(capacity=200_000, seed=42)
+    
+    # Store transition
+    buffer.push(state, action, reward, next_state, done)
+    
+    # Sample batch for training
+    batch = buffer.sample(batch_size=32)
+    
+    # Save/load for checkpointing
+    state = buffer.save_state()
+    buffer.load(state)
+"""
+
 import random
 import pickle
 import numpy as np
