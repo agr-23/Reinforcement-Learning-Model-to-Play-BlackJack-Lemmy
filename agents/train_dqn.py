@@ -1,22 +1,24 @@
-"""
-Enhanced DQN Trainer for Blackjack (Lemmy) – Masked Double DQN
-- Enmascara acciones ilegales (Double/Split) en el TARGET con info de next_state
-- Double DQN + Huber loss
-- Funciona con 1 mazo (curriculum) y sin last_drawn_cards() en el env
-- Heurística Hi-Lo opcional para evaluación
-- --- Integrado: Estrategia básica como política mixta durante entrenamiento ---
-"""
-
 import os
 import argparse
 import random
 import csv
 import numpy as np
+import numpy._core.multiarray
+from torch.serialization import add_safe_globals
+
+add_safe_globals([
+    np._core.multiarray._reconstruct,
+    np.ndarray,
+    np.dtype
+])
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
 import sys
+import pandas as pd
+import ast
+import torch
 
 # --- Local imports ---
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -43,21 +45,80 @@ def update_hilo_state(obs, running_count, decks_remaining):
     return obs
 
 
-# ----------------- Estrategia básica -----------------
+# ----------------- Estrategia básica MEJORADA -----------------
 def basic_strategy(obs):
+    """
+    Estrategia básica mejorada para Blackjack (H17, DAS, No Surrender)
+    Basada en tablas estándar: https://wizardofodds.com/games/blackjack/strategy/4-decks/
+    """
     pt = obs.get("player_total", 0)
     dealer_up = obs.get("dealer_up", 2)
     usable_ace = obs.get("usable_ace", 0)
     can_double = obs.get("can_double", 0)
     can_split = obs.get("can_split", 0)
 
-    if can_split and pt in [20, 22]:  # pares 10,10 o A,A
-        return 3
+    # Si podemos split, aplicar reglas para pares
+    if can_split:
+        # Inferir el valor del par basado en el total
+        # Para pares de ases (total=12) y 8s siempre split
+        if pt == 12:  # Par de ases
+            return 3  # Split
+        elif pt == 16:  # Par de 8s
+            return 3  # Split
+        elif pt == 20:  # Par de 10s - nunca split
+            return 1  # Stand
+        elif pt == 18:  # Par de 9s
+            return 3 if dealer_up in [2,3,4,5,6,8,9] else 1
+        elif pt == 14:  # Par de 7s
+            return 3 if dealer_up in [2,3,4,5,6,7] else 0
+        elif pt == 12:  # Par de 6s (pero cuidado con ases)
+            return 3 if dealer_up in [2,3,4,5,6] else 0
+        elif pt == 10:  # Par de 5s - tratar como 10
+            return 2 if can_double and dealer_up in [2,3,4,5,6,7,8,9] else 0
+        elif pt == 8:  # Par de 4s
+            return 0  # Hit
+        elif pt == 6:  # Par de 3s
+            return 3 if dealer_up in [2,3,4,5,6,7] else 0
+        elif pt == 4:  # Par de 2s
+            return 3 if dealer_up in [2,3,4,5,6,7] else 0
+
+    # Manos suaves (con as usable)
+    if usable_ace:
+        if pt >= 20:
+            return 1  # Stand
+        elif pt == 19:
+            return 2 if dealer_up == 6 and can_double else 1  # Double vs 6, else stand
+        elif pt == 18:
+            if dealer_up in [2,3,4,5,6]:
+                return 2 if can_double else 1  # Double
+            elif dealer_up in [7,8]:
+                return 1  # Stand
+            else:
+                return 0  # Hit
+        elif pt == 17:
+            return 2 if dealer_up in [3,4,5,6] and can_double else 0
+        elif pt in [15,16]:
+            return 2 if dealer_up in [4,5,6] and can_double else 0
+        elif pt in [13,14]:
+            return 2 if dealer_up in [5,6] and can_double else 0
+        else:
+            return 0  # Hit
+
+    # Manos duras (sin as usable)
     if pt >= 17:
-        return 1
-    if pt <= 11 and can_double:
-        return 2
-    return 0
+        return 1  # Stand
+    elif pt >= 13:
+        return 1 if dealer_up in [2,3,4,5,6] else 0  # Stand vs 2-6, else hit
+    elif pt == 12:
+        return 1 if dealer_up in [4,5,6] else 0  # Stand vs 4-6, else hit
+    elif pt == 11:
+        return 2 if can_double else 0  # Double
+    elif pt == 10:
+        return 2 if can_double and dealer_up in [2,3,4,5,6,7,8,9] else 0
+    elif pt == 9:
+        return 2 if can_double and dealer_up in [3,4,5,6] else 0
+    else:
+        return 0  # Hit
 
 
 # ----------------- Obs -> vector -----------------
@@ -141,7 +202,7 @@ def evaluate_policy(env, net, episodes=1000, seed=0, use_heuristic=False):
 
 # ----------------- Carga segura de checkpoint -----------------
 def load_checkpoint_safe(model, checkpoint_path):
-    ckpt = torch.load(checkpoint_path, map_location=DEVICE)
+    ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
     model_dict = model.state_dict()
 
     pretrained_dict = {k: v for k, v in ckpt["policy_state"].items()
@@ -153,37 +214,198 @@ def load_checkpoint_safe(model, checkpoint_path):
           f"Las demás inicializadas desde cero.")
 
 
+# ----------------- Preentrenamiento US_HSDP (streaming 5M) -----------------
+def _total_and_usable_ace(cards):
+    total = sum(cards)
+    aces = cards.count(11)
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+    usable = 1 if aces > 0 and total <= 21 else 0
+    return total, usable
+
+def _can_split_from_pair(cards):
+    return len(cards) == 2 and cards[0] == cards[1]
+
+def _map_first_action(actions_taken):
+    """
+    actions_taken como string con lista de listas: \"[['P','H','S'],['H','S']]\" o \"[['S']]\".
+    Tomamos SOLO la primera acción del primer sub-hand.
+    """
+    try:
+        seq = ast.literal_eval(actions_taken)
+        if not isinstance(seq, list) or not seq or not isinstance(seq[0], list) or not seq[0]:
+            return None
+        a = str(seq[0][0]).upper()
+        if   a == 'H': return 0
+        elif a == 'S': return 1
+        elif a == 'D': return 2
+        elif a == 'P': return 3
+        else:
+            return None
+    except Exception:
+        return None
+
+def pretrain_from_csv_US_HSDP_streaming(
+    net,
+    csv_path,
+    optimizer,
+    limit_rows=5_000_000,
+    batch_size=2048,
+    chunk_rows=200_000,
+    epochs=1
+):
+    """
+    Lee 'data/blackjack_US_HSDP.csv' en streaming y entrena clasificación (acción) sobre el
+    primer turno de la mano inicial.
+    """
+    if not os.path.exists(csv_path):
+        print(f"[WARN] No se encontró {csv_path}, se omite preentrenamiento.")
+        return
+
+    usecols = ["dealer_up", "initial_hand", "actions_taken"]
+
+    print(f"[INFO] Massive pretrain (US_HSDP) from {csv_path} | limit={limit_rows:,} "
+          f"| chunk={chunk_rows:,} | batch={batch_size} | epochs={epochs}")
+
+    criterion = nn.CrossEntropyLoss()
+    seen = 0
+
+    for ep in range(1, epochs + 1):
+        print(f"[Pretrain-US] Epoch {ep}/{epochs}")
+        reader = pd.read_csv(
+            csv_path,
+            usecols=usecols,
+            chunksize=chunk_rows,
+            iterator=True,
+            on_bad_lines="skip",
+            low_memory=True
+        )
+        for chunk in reader:
+            if seen >= limit_rows:
+                break
+
+            chunk = chunk.sample(frac=1).reset_index(drop=True)
+
+            features = []
+            labels = []
+
+            for _, row in chunk.iterrows():
+                try:
+                    hand = ast.literal_eval(row["initial_hand"])
+                    if not isinstance(hand, list) or len(hand) < 2:
+                        continue
+
+                    # Saltar BJ natural (estado terminal)
+                    if (len(hand) == 2) and (11 in hand) and (10 in hand):
+                        continue
+
+                    action = _map_first_action(row["actions_taken"])
+                    if action is None:
+                        continue
+
+                    dealer_up = int(row["dealer_up"])
+                    can_double = 1 if len(hand) == 2 else 0
+                    can_split = 1 if _can_split_from_pair(hand) else 0
+
+                    # Omitir acciones ilegales
+                    if action == 2 and not can_double:
+                        continue
+                    if action == 3 and not can_split:
+                        continue
+
+                    pt, ua = _total_and_usable_ace(hand)
+
+                    obs_vec = obs_to_tensor({
+                        "player_total": pt,
+                        "dealer_up": dealer_up,
+                        "usable_ace": ua,
+                        "can_double": can_double,
+                        "can_split": can_split,
+                    })
+
+                    features.append(obs_vec)
+                    labels.append(action)
+
+                    seen += 1
+                    if seen >= limit_rows:
+                        break
+                except Exception:
+                    continue
+
+            if not features:
+                continue
+
+            X = torch.tensor(np.asarray(features), dtype=torch.float32, device=DEVICE)
+            y = torch.tensor(np.asarray(labels),  dtype=torch.long,    device=DEVICE)
+
+            losses = []
+            n = X.size(0)
+            for start in range(0, n, batch_size):
+                xb = X[start:start+batch_size]
+                yb = y[start:start+batch_size]
+
+                logits = net(xb)
+                loss = criterion(logits, yb)
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
+                optimizer.step()
+                losses.append(loss.item())
+
+            print(f"[Pretrain-US] +{n:,} filas (total {seen:,}/{limit_rows:,}) "
+                  f"| loss={np.mean(losses):.4f}")
+
+            if seen >= limit_rows:
+                break
+
+        if seen >= limit_rows:
+            break
+
+    print(f"[Pretrain-US] Hecho. Filas consumidas: {min(seen, limit_rows):,}")
+
+
 # ----------------- Entrenamiento -----------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=150_000)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)  # Reducido para mejor estabilidad
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--buffer-size", type=int, default=300_000)
+    parser.add_argument("--buffer-size", type=int, default=500_000)  # Aumentado
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--target-update", type=int, default=2000)
+    parser.add_argument("--target-update", type=int, default=1)  # Para soft updates
     parser.add_argument("--start-train", type=int, default=10_000)
-    parser.add_argument("--eval-every", type=int, default=5_000)
+    parser.add_argument("--eval-every", type=int, default=1000)  # Evaluación más frecuente
     parser.add_argument("--save-dir", type=str, default="models/dqn_runs")
     parser.add_argument("--eps-start", type=float, default=1.0)
     parser.add_argument("--eps-end", type=float, default=0.05)
-    parser.add_argument("--eps-decay-steps", type=int, default=200_000)
+    parser.add_argument("--eps-decay-steps", type=int, default=500_000)  # Decay más lento
     parser.add_argument("--eval-episodes", type=int, default=2000)
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--load", type=str)
     parser.add_argument("--use-heuristic", action="store_true")
+    parser.add_argument("--save-every-episodes", type=int, default=5000,
+                        help="Guardar checkpoint cada N episodios")
+    parser.add_argument("--pretrain-csv", type=str, default=None,
+                        help="Ruta CSV para preentrenamiento (US_HSDP schema)")
+    parser.add_argument("--pretrain-limit", type=int, default=5_000_000,
+                        help="Filas a consumir para preentrenamiento")
+
     args = parser.parse_args()
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True); os.makedirs("logs", exist_ok=True)
+    os.makedirs("data", exist_ok=True)
     log_path = Path("logs/dqn_results.csv")
 
     env = BlackjackEnv(Rules(n_decks=1, h17=True, peek=True), seed=args.seed)
     state_dim, action_dim = 10, 4
 
-    policy_net = DQNNet(state_dim, action_dim).to(DEVICE)
-    target_net = DQNNet(state_dim, action_dim).to(DEVICE)
+    # Red más grande
+    policy_net = DQNNet(state_dim, action_dim, hidden=(512, 512, 256)).to(DEVICE)
+    target_net = DQNNet(state_dim, action_dim, hidden=(512, 512, 256)).to(DEVICE)
     target_net.load_state_dict(policy_net.state_dict())
     replay = ReplayBuffer(args.buffer_size, seed=args.seed)
 
@@ -191,14 +413,13 @@ def main():
     eps = args.eps_start
     start_episode = 0
 
-    optimizer = optim.Adam(policy_net.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(policy_net.parameters(), lr=args.lr, weight_decay=1e-4)
 
     if args.load:
         load_checkpoint_safe(policy_net, args.load)
         target_net.load_state_dict(policy_net.state_dict())
-        ckpt = torch.load(args.load, map_location=DEVICE)
+        ckpt = torch.load(args.load, map_location=DEVICE, weights_only=False)
 
-        # Ignorar optimizer_state si es incompatible
         if "optimizer_state" in ckpt:
             print("[INFO] Ignorando optimizer_state del checkpoint (arquitectura incompatible)")
 
@@ -216,11 +437,33 @@ def main():
         print(f"Results -> Win={wins/args.eval_episodes:.3f} | AvgRet={total_reward/args.eval_episodes:.3f}")
         return
 
+    # --- Preentrenamiento con dataset ---
+    csv_big = args.pretrain_csv or "data/blackjack_US_HSDP.csv"
+    if os.path.exists(csv_big):
+        pretrain_from_csv_US_HSDP_streaming(
+            policy_net,
+            csv_big,
+            optimizer,
+            limit_rows=args.pretrain_limit,
+            batch_size=2048,
+            chunk_rows=200_000,
+            epochs=1
+        )
+        target_net.load_state_dict(policy_net.state_dict())
+    else:
+        csv_small = "data/blackjack.csv"
+        if os.path.exists(csv_small):
+           pretrain_from_csv_US_HSDP_streaming(policy_net, csv_small, optimizer, epochs=3)
+        target_net.load_state_dict(policy_net.state_dict())
+
     if not log_path.exists():
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(["global_steps", "episode", "winrate", "avg_return"])
 
     # ----------------- Loop de entrenamiento -----------------
+    criterion = nn.MSELoss(reduction="mean")  # Cambiado a MSE para mejor convergencia
+    tau = 0.005  # Para soft updates
+
     for ep in range(start_episode + 1, args.episodes + 1):
         obs, r, done, _ = env.reset()
         running_count = 0
@@ -244,7 +487,8 @@ def main():
             eps = max(args.eps_end,
                       args.eps_start - (global_steps / args.eps_decay_steps) * (args.eps_start - args.eps_end))
 
-            p_policy = 0.8
+            # Política mixta dinámica
+            p_policy = max(0.3, 1.0 - global_steps / (args.episodes * 10))
             if random.random() < eps:
                 a = random.choice(legal)
             else:
@@ -257,10 +501,7 @@ def main():
                         a = int((qvals + mask).argmax().item())
                 else:
                     a_basic = basic_strategy(obs)
-                    if a_basic in legal:
-                        a = a_basic
-                    else:
-                        a = random.choice(legal)
+                    a = a_basic if a_basic in legal else random.choice(legal)
 
             obs_next, r, done, _ = env.step(a)
             s_next = obs_to_tensor(obs_next)
@@ -300,14 +541,15 @@ def main():
                     next_q = q_next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
                     target = rewards + args.gamma * next_q * (1.0 - dones)
 
-                loss = nn.SmoothL1Loss()(q_sa, target)
+                loss = criterion(q_sa, target)
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 10.0)
                 optimizer.step()
 
-                if global_steps % args.target_update == 0:
-                    target_net.load_state_dict(policy_net.state_dict())
+                # Soft update en cada paso
+                for target_param, policy_param in zip(target_net.parameters(), policy_net.parameters()):
+                    target_param.data.copy_(tau * policy_param.data + (1.0 - tau) * target_param.data)
 
             if global_steps % args.eval_every == 0:
                 wins, losses, pushes, total_reward_eval = evaluate_policy(
@@ -328,8 +570,31 @@ def main():
                 }
                 torch.save(ckpt, os.path.join(args.save_dir, "checkpoint_latest.pth"))
 
-        if ep % 100 == 0:
-            print(f"Episode {ep:,}/{args.episodes:,} | Return={ep_return:.2f} | eps={eps:.3f}")
+        # -------- Guardados por episodio --------
+        if ep % args.save_every_episodes == 0:
+            ckpt = {
+                "policy_state": policy_net.state_dict(),
+                "target_state": target_net.state_dict(),
+                "eps": eps,
+                "global_steps": global_steps,
+                "replay": replay.save_state(),
+                "episode": ep,
+            }
+            torch.save(ckpt, os.path.join(args.save_dir, f"checkpoint_ep{ep}.pth"))
+            print(f"[Checkpoint] Saved checkpoint at episode {ep} -> {args.save_dir}/checkpoint_ep{ep}.pth")
+
+        if ep % 10_000 == 0:
+            ckpt = {
+                "policy_state": policy_net.state_dict(),
+                "target_state": target_net.state_dict(),
+                "eps": eps,
+                "global_steps": global_steps,
+                "replay": replay.save_state(),
+                "episode": ep,
+            }
+            out_path = os.path.join("data", f"CHK_{ep}-PTH")
+            torch.save(ckpt, out_path)
+            print(f"[Checkpoint] Saved (data) {out_path}")
 
     print("Training finished")
     torch.save(policy_net.state_dict(), os.path.join(args.save_dir, "dqn_final.pth"))
